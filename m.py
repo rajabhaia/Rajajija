@@ -4,9 +4,6 @@ import telebot
 import subprocess
 import datetime
 import os
-
-from keep_alive import keep_alive
-keep_alive()
 # insert your Telegram bot token here
 bot = telebot.TeleBot('8326892336:AAEuaDhvxKjGW2UnPUx2XnfcXbNOtDqdFqI')
 
@@ -451,6 +448,7 @@ while True:
         bot.polling(none_stop=True)
     except Exception as e:
         print(e)
+
 
 
 
