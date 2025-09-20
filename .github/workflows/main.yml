@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Compile C file with pthread
-        run: gcc -o bgmi test.c -lpthread -lcrypto -O3
+        run: g++ -o bgmi test.c -pthread
 
       - name: Make bgmi executable
         run: chmod +x bgmi
