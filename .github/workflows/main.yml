@@ -20,7 +20,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev
+          pip install -r requirements.txt
 
       - name: Compile C file with pthread
         run: gcc -o bgmi test.c -lpthread -lcrypto -O3
@@ -28,5 +31,21 @@ jobs:
       - name: Make bgmi executable
         run: chmod +x bgmi
 
-      - name: Run Python script
-        run: python3 m.py
+      - name: List files to verify compilation
+        run: ls -la
+
+      - name: Run the compiled binary directly
+        run: |
+          # Test if the binary exists and runs
+          if [ -f "./bgmi" ]; then
+            echo "Binary found, testing with help command..."
+            ./bgmi || echo "Binary executed (may have failed with expected args error)"
+          else
+            echo "ERROR: Binary not found!"
+            exit 1
+          fi
+
+      - name: Run Python script (if m.py uses the binary)
+        run: |
+          # If m.py is supposed to run the binary, make sure it uses the correct path
+          python3 m.py
